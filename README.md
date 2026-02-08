@@ -51,6 +51,7 @@ cd rate-limiter && mvn spring-boot:run
 Each system contains:
 - **HLD** - High-Level Design with architecture diagrams
 - **LLD** - Low-Level Design with class diagrams
+- **API_FLOW** - How APIs work, step-by-step flow, sequence diagrams
 - **Flow Charts** - Request flows, decision trees
 - **Design Decisions** - SQL vs NoSQL, technology choices
 - **Edge Cases** - Handling and mitigation

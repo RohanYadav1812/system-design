@@ -59,17 +59,26 @@ A distributed rate limiting system that protects APIs from abuse, ensures fair u
 flowchart TD
     A[Client Request] --> B[Load Balancer]
     B --> C[API Gateway]
-    C --> D{Rate Limiter Check}
-    D -->|Key: user_id + endpoint|
-    D --> E[Redis: Get/Increment]
-    E --> F{Within Limit?}
-    F -->|Yes| G[Forward to Backend]
-    F -->|No| H[429 Too Many Requests]
-    G --> I[Add Rate Limit Headers]
-    I --> J[Return Response]
-    H --> K[Add Retry-After Header]
-    K --> J
+    C --> D[Rate Limit Filter]
+    D --> E[Extract Key: user/ip/apiKey + endpoint]
+    E --> F[Resolve Config: endpoint → limits]
+    F --> G[Redis: Lua Script - Atomic check]
+    G --> H{Within Limit?}
+    H -->|Yes| I[Add X-RateLimit-Remaining header]
+    I --> J[Forward to Backend Controller]
+    J --> K[Return 200 + Response]
+    H -->|No| L[429 + Retry-After header]
+    L --> K
 ```
+
+## Step-by-Step Request Flow
+
+1. **Request arrives** → RateLimitFilter intercepts (before Controller)
+2. **Identity** → Extract X-User-Id, X-API-Key, or client IP
+3. **Config lookup** → Match path to endpoint config (e.g. /api/login → 5/min)
+4. **Algorithm** → Token bucket or sliding window based on endpoint
+5. **Redis** → Single Lua script: refill tokens, deduct if allowed
+6. **Response** → Allow + headers, or 429 + Retry-After
 
 ## Design Decisions
 
