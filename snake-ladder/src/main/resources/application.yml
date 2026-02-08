@@ -1,0 +1,16 @@
+server:
+  port: ${SERVER_PORT:8082}
+
+spring:
+  application:
+    name: snake-ladder
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+
+game:
+  max-players: ${GAME_MAX_PLAYERS:4}
+  min-players: ${GAME_MIN_PLAYERS:2}
+  board-size: ${GAME_BOARD_SIZE:100}
+  game-ttl-seconds: ${GAME_TTL:3600}

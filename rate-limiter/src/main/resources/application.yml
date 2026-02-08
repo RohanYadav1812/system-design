@@ -1,0 +1,52 @@
+server:
+  port: ${SERVER_PORT:8080}
+
+spring:
+  application:
+    name: rate-limiter
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      timeout: ${REDIS_TIMEOUT:200ms}
+      lettuce:
+        pool:
+          max-active: ${REDIS_POOL_MAX:16}
+          max-idle: ${REDIS_POOL_IDLE:8}
+          min-idle: ${REDIS_POOL_MIN:2}
+
+# Rate Limiter Configuration - No hardcoding
+rate-limiter:
+  enabled: ${RATE_LIMITER_ENABLED:true}
+  fail-open: ${RATE_LIMITER_FAIL_OPEN:true}
+  key-prefix: ${RATE_LIMITER_KEY_PREFIX:rl}
+  default:
+    algorithm: ${RATE_LIMITER_DEFAULT_ALGORITHM:token-bucket}
+    tokens-per-second: ${RATE_LIMITER_DEFAULT_TPS:10}
+    capacity: ${RATE_LIMITER_DEFAULT_CAPACITY:100}
+    window-seconds: ${RATE_LIMITER_DEFAULT_WINDOW:60}
+  endpoints:
+    /api/login:
+      algorithm: sliding-window
+      max-requests: 5
+      window-seconds: 60
+    /api/register:
+      algorithm: sliding-window
+      max-requests: 3
+      window-seconds: 3600
+    /api/search:
+      tokens-per-second: 20
+      capacity: 200
+    /api/*:
+      tokens-per-second: 10
+      capacity: 100
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics,prometheus
+  endpoint:
+    health:
+      show-details: when-authorized

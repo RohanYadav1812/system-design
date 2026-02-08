@@ -1,0 +1,16 @@
+server:
+  port: ${SERVER_PORT:8083}
+
+spring:
+  application:
+    name: logging-service
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+
+logging:
+  topic: ${LOG_TOPIC:logs}
+  batch-size: ${LOG_BATCH_SIZE:100}
+  flush-interval-ms: ${LOG_FLUSH_INTERVAL:5000}
