@@ -1,6 +1,6 @@
 # HLD & LLD — High-Level and Low-Level Design
 
-> **📐 Flowcharts:** All flowcharts are **Excalidraw** files in the `HLD-LLD-diagrams` folder. Open any `.excalidraw` file in VS Code (with the Excalidraw extension) to view or edit. Links are placed next to each section below.
+> **📐 Flowcharts:** All flowcharts are inline **Mermaid** diagrams below each section. They render on GitHub, VS Code (Markdown Preview), and [mermaid.live](https://mermaid.live) for editing.
 
 ---
 
@@ -54,7 +54,38 @@ High-Level Design describes the **system from a bird’s-eye view**: main buildi
 
 ### 1.3 High-level architecture
 
-**📐 [Open in Excalidraw: High-level architecture](HLD-LLD-diagrams/01-high-level-architecture.excalidraw)** — Draw: Clients (Web, Mobile, Partner) → Edge (LB, API Gateway) → App (REST, Auth, Business Logic) → Data (Primary DB, Redis, Queue).
+```mermaid
+flowchart LR
+    subgraph Clients
+        Web[Web App]
+        Mobile[Mobile App]
+        Partner[Partner API]
+    end
+    subgraph Edge
+        LB[Load Balancer]
+        GW[API Gateway]
+    end
+    subgraph App
+        REST[REST API]
+        Auth[Auth Service]
+        BL[Business Logic]
+    end
+    subgraph Data
+        DB[(Primary DB)]
+        Redis[(Redis)]
+        Queue[Message Queue]
+    end
+    Web --> LB
+    Mobile --> LB
+    Partner --> LB
+    LB --> GW
+    GW --> REST
+    REST --> Auth
+    REST --> BL
+    BL --> DB
+    BL --> Redis
+    BL --> Queue
+```
 
 | Layer | Role |
 |-------|------|
@@ -80,7 +111,32 @@ High-Level Design describes the **system from a bird’s-eye view**: main buildi
 
 ### 1.5 High-level data flow (detailed)
 
-**📐 [Open in Excalidraw: High-level data flow](HLD-LLD-diagrams/02-high-level-data-flow.excalidraw)** — Draw: User → (1) Request → Gateway → (2) API → SVC → (3a) DB, (3b) Redis → (4–5) Response back.
+```mermaid
+sequenceDiagram
+    participant User
+    participant Gateway
+    participant API
+    participant SVC as Service
+    participant DB as Primary DB
+    participant Redis
+
+    User->>Gateway: 1. Request (Pre-URL + path + token)
+    Gateway->>Gateway: Add request UID, route
+    Gateway->>API: 2. Forward request
+    API->>API: Resolve user / session UID
+    API->>SVC: Invoke handler
+    alt Cache hit
+        SVC->>Redis: 3b. Read by UID
+        Redis-->>SVC: Cached entity
+    else Cache miss
+        SVC->>DB: 3a. Read / write
+        DB-->>SVC: Entity data
+        SVC->>Redis: Populate cache
+    end
+    SVC-->>API: Result
+    API-->>Gateway: 4. Response
+    Gateway-->>User: 5. Response
+```
 
 **Flow summary:** Client calls Pre-URL + path with token → Gateway adds request UID and routes → API resolves user/session UID → Service uses primary DB and Redis (by UID) → response returned.
 
@@ -129,7 +185,22 @@ High-Level Design describes the **system from a bird’s-eye view**: main buildi
 
 ### 4.3 Data flow: DB vs Redis (when to use which)
 
-**📐 [Open in Excalidraw: DB vs Redis flow](HLD-LLD-diagrams/03-data-flow-db-vs-redis.excalidraw)** — Draw: Request → Auth → Redis (session) → Handler → Cache or DB; write to DB then invalidate cache.
+```mermaid
+flowchart TD
+    A[Incoming Request] --> B[Auth Middleware]
+    B --> C[(Redis: session_uid → user_uid)]
+    C --> D[Handler]
+    D --> E{Read entity by UID?}
+    E -->|Yes| F{Cache hit?}
+    F -->|Yes| G[(Redis: entity cache)]
+    F -->|No| H[(Primary DB)]
+    H --> I[Populate Redis cache]
+    G --> J[Return response]
+    I --> J
+    E -->|Write| K[Write to DB first]
+    K --> L[Invalidate / update Redis]
+    L --> J
+```
 
 | Step | Where | Why |
 |------|--------|-----|
@@ -220,7 +291,22 @@ ON create_entity(type):
 
 **Why no central server?** UUID v4 and ULID use enough randomness that two servers generating in parallel will not collide in practice. So we avoid a single point of failure and latency of a “UID service.”
 
-**📐 [Open in Excalidraw: UID generation flow](HLD-LLD-diagrams/12-uid-generation-flow.excalidraw)** — Draw: Create entity → Choose algorithm (UUID v4 / ULID / prefix+random) → Generate value → Optional duplicate check → Insert into DB → Return UID (201 + Location).
+```mermaid
+flowchart TD
+    A[Create entity request] --> B{Need time-ordered UID?}
+    B -->|Yes| C[Generate ULID]
+    B -->|No| D[Generate UUID v4]
+    C --> E{Add type prefix?}
+    D --> E
+    E -->|Yes| F["Prefix + UID<br/>e.g. usr_01J2..."]
+    E -->|No| G[Raw UID value]
+    F --> H{Optional uniqueness check}
+    G --> H
+    H --> I[Insert into DB<br/>uid UNIQUE constraint]
+    I --> J{Duplicate key error?}
+    J -->|Yes| D
+    J -->|No| K["Return 201 Created<br/>Location: Pre-URL + path + uid"]
+```
 
 ---
 
@@ -338,19 +424,59 @@ When a **file upload is interrupted** (connection drop, timeout, device sleep), 
 
 #### 2.4.5 Flow — initial upload
 
-**📐 [Open in Excalidraw: Resumable upload — initial](HLD-LLD-diagrams/13-resumable-upload-initial.excalidraw)** — Draw: Client → POST init → 201 upload_uid → PUT chunk 1 → 200 → PUT chunk 2 → CONNECTION DROPS.
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Server
+    participant Storage as Blob Storage
+
+    Client->>Server: POST /uploads/init (filename, size)
+    Server-->>Client: 201 upload_uid, chunk_size
+    Client->>Server: PUT /uploads/{uid}?offset=0 (chunk 1)
+    Server->>Storage: Store block 1
+    Server-->>Client: 200 OK
+    Client->>Server: PUT /uploads/{uid}?offset=5242880 (chunk 2)
+    Note over Client,Server: CONNECTION DROPS — chunk 2 incomplete
+```
 
 ---
 
 #### 2.4.6 Flow — after interruption: resume
 
-**📐 [Open in Excalidraw: Resumable upload — resume](HLD-LLD-diagrams/14-resumable-upload-resume.excalidraw)** — Draw: Client → GET status → 200 received_ranges → PUT missing chunks → POST commit → 201 file_uid.
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Server
+    participant Storage as Blob Storage
+
+    Client->>Server: GET /uploads/{upload_uid}/status
+    Server-->>Client: 200 received_ranges, total_size
+    Client->>Server: PUT missing chunk(s) only
+    Server->>Storage: Store remaining blocks
+    Server-->>Client: 200 OK
+    Client->>Server: POST /uploads/{upload_uid}/commit
+    Server->>Storage: Commit block list → final blob
+    Server-->>Client: 201 file_uid / download URL
+```
 
 ---
 
 #### 2.4.7 Flow — decision view (when to resume vs start over)
 
-**📐 [Open in Excalidraw: Resumable upload — decision](HLD-LLD-diagrams/15-resumable-upload-decision.excalidraw)** — Draw: User selects file → Have upload_uid? (Yes: GET status, upload missing only; No: POST init, upload all) → All bytes done? → POST commit → file_uid.
+```mermaid
+flowchart TD
+    A[User selects file] --> B{Have existing upload_uid?}
+    B -->|Yes| C[GET /uploads/{uid}/status]
+    C --> D[Upload missing ranges only]
+    B -->|No| E[POST /uploads/init]
+    E --> F[Upload all chunks from offset 0]
+    D --> G{All bytes received?}
+    F --> G
+    G -->|No| H[Save last successful offset<br/>Retry on reconnect]
+    H --> C
+    G -->|Yes| I[POST /uploads/{uid}/commit]
+    I --> J[Return file_uid / download URL]
+```
 
 ---
 
@@ -384,7 +510,17 @@ Low-Level Design breaks the HLD into **concrete modules, classes, APIs, and data
 | **Inputs** | Full URL (Pre-URL + path); headers (e.g. `Authorization`, `X-Request-Id`, `X-Session-Id`); body (for POST/PUT/PATCH). |
 | **Outputs** | Parsed path, method, query params; resolved user/session UID (if authenticated); request UID for logging. |
 
-**📐 [Open in Excalidraw: Request handling flow](HLD-LLD-diagrams/04-request-handling.excalidraw)** — Draw: HTTP Request → Extract path → Valid? (No→404, Yes→) → Request UID → Resolve UIDs → Handler → Response.
+```mermaid
+flowchart TD
+    A[HTTP Request] --> B[Extract path + method]
+    B --> C{Valid route?}
+    C -->|No| D[404 Not Found]
+    C -->|Yes| E[Generate / read request UID]
+    E --> F[Resolve user + session UID]
+    F --> G[Route to handler]
+    G --> H[Build response]
+    H --> I[Return HTTP response]
+```
 
 ---
 
@@ -401,7 +537,23 @@ Low-Level Design breaks the HLD into **concrete modules, classes, APIs, and data
 3. Extract or look up **user UID** and **session UID**.
 4. Attach to request context for downstream use.
 
-**📐 [Open in Excalidraw: Auth sequence](HLD-LLD-diagrams/05-auth-sequence.excalidraw)** — Draw sequence: Client → Gateway → Auth → Redis (session) → Auth → Gateway → Service → Response.
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Gateway
+    participant Auth
+    participant Redis
+    participant Service
+
+    Client->>Gateway: Request + Authorization header
+    Gateway->>Auth: Validate token / API key
+    Auth->>Redis: Lookup session_uid
+    Redis-->>Auth: user_uid, permissions
+    Auth-->>Gateway: Identity attached to context
+    Gateway->>Service: Forward request + UIDs
+    Service-->>Gateway: Response
+    Gateway-->>Client: Response
+```
 
 ---
 
@@ -417,7 +569,18 @@ Low-Level Design breaks the HLD into **concrete modules, classes, APIs, and data
 - **Create:** Generate new UID, validate input, persist, return 201 + location using Pre-URL.
 - **Update/Delete:** Resolve entity by UID, check permissions, apply change.
 
-**📐 [Open in Excalidraw: Business logic data flow](HLD-LLD-diagrams/06-business-logic-data-flow.excalidraw)** — Draw: Request + UID → Validate → Business rules → Persist → Response + Location (Pre-URL + path + new_uid).
+```mermaid
+flowchart LR
+    A[Request + UID] --> B[Validate input]
+    B --> C[Apply business rules]
+    C --> D{Operation?}
+    D -->|Create| E[Generate new UID]
+    D -->|Read/Update/Delete| F[Fetch by UID]
+    E --> G[Persist to DB]
+    F --> G
+    G --> H[Invalidate / update cache]
+    H --> I["Response + Location header<br/>Pre-URL + path + uid"]
+```
 
 ---
 
@@ -468,13 +631,57 @@ All URLs are built as: **`{Pre-URL}{/path}[/{resource_uid}]`**
 
 ### 3.4 End-to-end request flow (LLD) — detailed
 
-**📐 [Open in Excalidraw: End-to-end request flow](HLD-LLD-diagrams/07-end-to-end-request.excalidraw)** — Draw sequence: Client → Config (Pre-URL) → Gateway → Auth → Redis → Handler → Redis/DB (cache hit or miss) → Response.
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Config as Client Config
+    participant Gateway
+    participant Auth
+    participant Redis
+    participant Handler
+    participant DB
+
+    Client->>Config: Read Pre-URL for environment
+    Config-->>Client: base URL
+    Client->>Gateway: GET Pre-URL/users/{uid} + token
+    Gateway->>Auth: Validate identity
+    Auth->>Redis: Session lookup
+    Redis-->>Auth: user_uid
+    Auth-->>Gateway: OK
+    Gateway->>Handler: Forward request
+    alt Cache hit
+        Handler->>Redis: GET user:{uid}
+        Redis-->>Handler: Cached user
+    else Cache miss
+        Handler->>DB: SELECT by uid
+        DB-->>Handler: User row
+        Handler->>Redis: SET user:{uid}
+    end
+    Handler-->>Gateway: 200 + JSON body
+    Gateway-->>Client: Response
+```
 
 ---
 
 ### 3.5 Error handling flow
 
-**📐 [Open in Excalidraw: Error handling flow](HLD-LLD-diagrams/08-error-handling.excalidraw)** — Draw: Error → Type? → 400/401/403/404/409/500 → Return response → Log with request UID.
+```mermaid
+flowchart TD
+    A[Error occurs] --> B{Error type?}
+    B -->|Validation| C[400 Bad Request]
+    B -->|Missing / invalid token| D[401 Unauthorized]
+    B -->|Forbidden access| E[403 Forbidden]
+    B -->|UID not found| F[404 Not Found]
+    B -->|Conflict / duplicate| G[409 Conflict]
+    B -->|Unexpected| H[500 Internal Server Error]
+    C --> I[Return error response]
+    D --> I
+    E --> I
+    F --> I
+    G --> I
+    H --> I
+    I --> J[Log with request UID for tracing]
+```
 
 ---
 
@@ -482,15 +689,49 @@ All URLs are built as: **`{Pre-URL}{/path}[/{resource_uid}]`**
 
 ### 5.1 System context (HLD) — detailed
 
-**📐 [Open in Excalidraw: System context](HLD-LLD-diagrams/09-system-context.excalidraw)** — Draw: Users (Web, Mobile, Partner) → Gateway → App → DB / Redis.
+```mermaid
+flowchart TB
+    subgraph Users
+        Web[Web Users]
+        Mobile[Mobile Users]
+        Partner[Partner Systems]
+    end
+    Gateway[API Gateway / Load Balancer]
+    App[Application Services]
+    DB[(Primary DB)]
+    Redis[(Redis Cache / Session)]
+
+    Web --> Gateway
+    Mobile --> Gateway
+    Partner --> Gateway
+    Gateway --> App
+    App --> DB
+    App --> Redis
+```
 
 ### 5.2 UID lifecycle — detailed
 
-**📐 [Open in Excalidraw: UID lifecycle](HLD-LLD-diagrams/10-uid-lifecycle.excalidraw)** — Draw: Create entity → Generate UID → DB → Redis (optional) → 201 Location → Client uses UID → Server resolves by UID.
+```mermaid
+flowchart LR
+    A[Create entity] --> B[Generate UID]
+    B --> C[(Insert into DB)]
+    C --> D[(Optional: cache in Redis)]
+    D --> E["201 Created<br/>Location: Pre-URL + path + uid"]
+    E --> F[Client stores / uses UID]
+    F --> G[Subsequent requests reference UID]
+    G --> H[Server resolves entity by UID]
+```
 
 ### 5.3 Pre-URL usage (client-side) — detailed
 
-**📐 [Open in Excalidraw: Pre-URL usage](HLD-LLD-diagrams/11-pre-url-usage.excalidraw)** — Draw: Config (Environment → Pre-URL) → Build (Path + UID → Full URL) → HTTP request.
+```mermaid
+flowchart LR
+    A[Environment config] --> B["Pre-URL<br/>e.g. https://api.example.com/v1"]
+    C[Resource path + UID] --> D[Build full URL]
+    B --> D
+    D --> E["Full URL<br/>Pre-URL + /users/{uid}"]
+    E --> F[HTTP request]
+```
 
 ---
 
@@ -552,14 +793,15 @@ All URLs are built as: **`{Pre-URL}{/path}[/{resource_uid}]`**
 
 | Version | Date | Author | Changes |
 |---------|------|--------|---------|
-| 1.0 | 2025-02-17 | — | Initial HLD + LLD; Confluence-style; UID/Pre-URL |
-| 1.1 | 2025-02-17 | — | Prettier flowcharts; Data layer (DB, Redis); Microsoft interview; follow-up & logic questions |
-| 1.2 | 2025-02-17 | — | UID generation logic; resumable file upload; ASCII flow diagrams |
+| 1.4 | 2025-06-28 | — | Replaced Excalidraw links with inline Mermaid flow diagrams |
 | 1.3 | 2025-02-17 | — | All flowcharts moved to Excalidraw (HLD-LLD-diagrams folder); Mermaid/ASCII replaced with Excalidraw links |
+| 1.2 | 2025-02-17 | — | UID generation logic; resumable file upload; ASCII flow diagrams |
+| 1.1 | 2025-02-17 | — | Prettier flowcharts; Data layer (DB, Redis); Microsoft interview; follow-up & logic questions |
+| 1.0 | 2025-02-17 | — | Initial HLD + LLD; Confluence-style; UID/Pre-URL |
 
 ---
 
-> **💡 Confluence:** Use a Mermaid macro or export from [mermaid.live](https://mermaid.live) and attach as images.  
+> **💡 Confluence / GitHub:** Mermaid diagrams render natively on GitHub. For Confluence, paste into a Mermaid macro or export PNG from [mermaid.live](https://mermaid.live).  
 > **🎯 Microsoft interview:** Use Part 4 (DB/Redis), Part 6 (follow-ups), and Part 7 (logic) to practice explaining your design and trade-offs.
 
 How UID is generated
