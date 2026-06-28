@@ -21,7 +21,7 @@
 ## 📑 On this page
 
 - [Part 1 — High-Level Design (HLD)](#part-1--high-level-design-hld)
-- [Part 2 — Key concepts (UID, Pre-URL, glossary)](#part-2--key-concepts-detailed)
+- [Part 2 — Key concepts (UID, pre-signed URLs, Base URL, object storage)](#part-2--key-concepts-detailed)
 - [Part 3 — Low-Level Design (LLD)](#part-3--low-level-design-lld)
 - [Part 4 — Data layer: DB & Redis (why, which, when)](#part-4--data-layer-db--redis)
 - [Part 5 — Flow diagrams (detailed)](#part-5--flow-diagrams-summary)
@@ -89,7 +89,7 @@ flowchart LR
 
 | Layer | Role |
 |-------|------|
-| **Clients** | Web, mobile, partners — all use Pre-URL to reach the right environment. |
+| **Clients** | Web, mobile, partners — all use **Base URL** to reach the right API environment. |
 | **Edge** | Load balancer + API gateway: TLS, routing, rate limit, request UID injection. |
 | **Application** | REST API, auth (resolve user/session UID), business rules. |
 | **Data** | Primary DB (source of truth), Redis (cache/session), queue (async jobs). |
@@ -100,7 +100,7 @@ flowchart LR
 
 | Component | Responsibility |
 |-----------|----------------|
-| **Client / UI** | User interaction, calls APIs using base/pre-URL |
+| **Client / UI** | User interaction; API calls use Base URL; file bytes upload via **pre-signed URLs** |
 | **API Gateway** | Routing, rate limiting, SSL termination |
 | **Application services** | Request handling, orchestration |
 | **Business logic** | Rules, validations, workflows |
@@ -120,7 +120,7 @@ sequenceDiagram
     participant DB as Primary DB
     participant Redis
 
-    User->>Gateway: 1. Request (Pre-URL + path + token)
+    User->>Gateway: 1. Request (Base URL + path + token)
     Gateway->>Gateway: Add request UID, route
     Gateway->>API: 2. Forward request
     API->>API: Resolve user / session UID
@@ -138,7 +138,7 @@ sequenceDiagram
     Gateway-->>User: 5. Response
 ```
 
-**Flow summary:** Client calls Pre-URL + path with token → Gateway adds request UID and routes → API resolves user/session UID → Service uses primary DB and Redis (by UID) → response returned.
+**Flow summary:** Client calls Base URL + path with token → Gateway adds request UID and routes → API resolves user/session UID → Service uses primary DB and Redis (by UID) → response returned. For **file uploads**, the client uploads bytes **directly to S3/Azure Blob** using **pre-signed URLs** returned by the API (bytes never pass through the app server).
 
 ---
 
@@ -147,7 +147,7 @@ sequenceDiagram
 | Area | HLD guidance |
 |------|------------------|
 | **Scalability** | Horizontal scaling of stateless services; UID used for correlation and partitioning where needed. |
-| **Security** | Auth tokens, UID for audit and access control; pre-URL/base-URL for correct environment routing. |
+| **Security** | Auth tokens, UID for audit and access control; Base URL for correct environment routing; pre-signed URLs for scoped, time-bound storage access. |
 | **Availability** | Redundancy at gateway and service layer; data layer replication as per LLD. |
 
 ---
@@ -216,7 +216,8 @@ flowchart TD
 |-----------|--------|-----|
 | **Primary DB** | Azure SQL Database or Azure Database for PostgreSQL | Managed, HA, backups; UID as PK; good for interview. |
 | **Cache / session** | Azure Cache for Redis | Managed Redis; session store and cache by UID. |
-| **API Gateway** | Azure API Management or App Gateway | Routing, rate limit, TLS; Pre-URL points here. |
+| **API Gateway** | Azure API Management or App Gateway | Routing, rate limit, TLS; Base URL points here. |
+| **Object storage** | **Amazon S3** or **Azure Blob Storage** | Durable file/chunk storage; multipart upload; pre-signed URL / SAS generation |
 | **Hosting** | Azure App Service / AKS | Stateless app tier; scale out. |
 
 ---
@@ -305,66 +306,216 @@ flowchart TD
     H --> I[Insert into DB<br/>uid UNIQUE constraint]
     I --> J{Duplicate key error?}
     J -->|Yes| D
-    J -->|No| K["Return 201 Created<br/>Location: Pre-URL + path + uid"]
+    J -->|No| K["Return 201 Created<br/>Location: Base URL + path + uid"]
 ```
 
 ---
 
-### 2.2 What is Pre-URL and why we need it
+### 2.2 Pre-signed URLs — definition, generation, and object storage
 
-#### Definition
+> **Do not confuse with Base URL.**  
+> - **Base URL** = API prefix (e.g. `https://api.example.com/v1`) — where the client calls *your* backend.  
+> - **Pre-signed URL** = temporary, cryptographically signed link — where the client uploads/downloads *file bytes* directly to **S3** or **Azure Blob** without your server proxying the file.
 
-**Pre-URL** (also **base URL**, **root URL**, or **environment URL**) is the **prefix** of the full URL used to reach the system. It includes:
+#### What is a pre-signed URL?
 
-- **Scheme:** `https://`
-- **Host:** e.g. `api.example.com`, `staging-api.example.com`
-- **Optional base path:** e.g. `/v1`, `/api`
+A **pre-signed URL** is a full HTTPS URL that includes a **cryptographic signature** (and expiry) proving:
 
-**Examples:**
+| Bound property | Example |
+|----------------|---------|
+| **Who signed it** | Your backend's IAM role (AWS) or Managed Identity (Azure) |
+| **What action is allowed** | `PUT` part #3, `GET` object, `UploadPart` |
+| **Which object** | `bucket/uploads/usr_abc/upl_xyz/part-3` |
+| **When it expires** | e.g. 10–15 minutes |
+| **Optional headers** | `Content-Type`, checksum headers |
 
-| Environment | Pre-URL |
-|-------------|---------|
-| Production | `https://api.example.com/v1` |
-| Staging / Pre-production | `https://staging-api.example.com/v1` |
-| Local | `https://localhost:8443/v1` |
+The client receives this URL from your API and sends the file chunk with a normal `PUT` — **no AWS/Azure credentials on the client**.
 
-#### Why we need Pre-URL
+#### Why pre-signed URLs (not upload through backend)?
 
-| Reason | Explanation |
-|--------|-------------|
-| **Environment separation** | Different pre-URLs for dev, staging, pre-prod, prod so clients hit the right environment. |
-| **Configuration** | Client app stores one “pre-URL”; all API calls are built as `preURL + path` (e.g. `preURL + "/users/" + uid`). |
-| **Security** | Prod pre-URL is not mixed with test; credentials and data stay per environment. |
-| **Testing** | QA and automation point to staging/pre-prod pre-URL without code changes. |
-| **Multi-region** | Different pre-URLs per region (e.g. `api-us.example.com`, `api-eu.example.com`). |
+| Approach | Problem |
+|----------|---------|
+| **Proxy file through API server** | Backend becomes bandwidth bottleneck; expensive egress; hard to scale GB–TB uploads |
+| **Give client long-lived storage keys** | Credential leak = full bucket compromise |
+| **Pre-signed URL** | Client uploads directly to storage; scoped permission; auto-expires; backend only orchestrates |
 
-#### How Pre-URL is used
+```mermaid
+flowchart TD
+    A[Client: POST /uploads/init] --> B[Upload Service]
+    B --> C[Auth: validate user JWT]
+    C --> D[Create upload_uid in DB]
+    D --> E["S3: CreateMultipartUpload<br/>or Azure: Put Block (stage)"]
+    E --> F[For each chunk/part]
+    F --> G["Build canonical request<br/>method + bucket + key + uploadId + partNumber + expiry"]
+    G --> H["Sign with IAM role / Managed Identity<br/>AWS SigV4 or Azure SAS"]
+    H --> I[Return pre-signed URL per part to client]
+    I --> J["Client PUT bytes directly to S3/Azure<br/>(not through your API)"]
+    J --> K[Client reports ETag / blockId to API]
+    K --> L["API: CompleteMultipartUpload<br/>or Commit Block List"]
+```
 
-1. **Client configuration**  
-   `BASE_URL = "https://staging-api.example.com/v1"`
-2. **Building requests**  
-   `GET ${BASE_URL}/users/${userUid}`  
-   Full URL = Pre-URL + path + query params.
-3. **Server-side redirects**  
-   Redirect responses use the same pre-URL (or configured base) so links point to the correct environment.
+#### How a pre-signed URL is generated (step by step)
 
-#### Pre-URL vs full URL
+1. **Client calls your API** — `POST /uploads/init` with filename, size, content-type (via **Base URL**).
+2. **Backend authenticates** the user and creates an **upload_uid** in the metadata DB.
+3. **Backend starts a multipart session in storage** (server-side only):
+   - **S3:** `CreateMultipartUpload` → returns `UploadId`
+   - **Azure Blob:** block blob staging session (block IDs tracked per upload)
+4. **For each chunk**, backend builds the request it will allow:
+   - HTTP method (`PUT`)
+   - Bucket/container + object key (scoped prefix, e.g. `uploads/{user_uid}/{upload_uid}/`)
+   - Part number / block ID
+   - Expiry (typically 10–15 min)
+5. **Backend signs** the request:
+   - **AWS:** HMAC-SHA256 (Signature Version 4) using the service's IAM role via `S3Presigner`
+   - **Azure:** Shared Access Signature (SAS) token with `w` (write) permission on a specific blob path
+6. **Backend returns** `{ partNumber, preSignedUrl, expiresAt }` to the client.
+7. **Client uploads** with `PUT preSignedUrl` + chunk bytes → storage validates signature and stores the part.
+8. **On complete**, backend calls `CompleteMultipartUpload` (S3) or `Put Block List` (Azure) to merge parts into the final object.
 
-| Part | Example |
-|------|---------|
-| **Pre-URL** | `https://api.example.com/v1` |
-| **Path** | `/users/usr_abc123` |
-| **Full URL** | `https://api.example.com/v1/users/usr_abc123` |
+**S3 generation (Java / AWS SDK v2 pseudocode):**
 
-> **📌 Note**  
-> In Confluence you can store environment-specific Pre-URLs in a separate runbook or config page and link to it from here.
+```java
+// 1) Server creates multipart session (never on client)
+CreateMultipartUploadResponse create = s3.createMultipartUpload(
+  CreateMultipartUploadRequest.builder()
+    .bucket(bucket)
+    .key("uploads/" + userUid + "/" + uploadUid)
+    .contentType(mimeType)
+    .build()
+);
+String storageUploadId = create.uploadId();
+
+// 2) Pre-sign one part
+UploadPartRequest partReq = UploadPartRequest.builder()
+  .bucket(bucket)
+  .key(objectKey)
+  .uploadId(storageUploadId)
+  .partNumber(partNumber)
+  .build();
+
+PresignedUploadPartRequest presigned = presigner.presignUploadPart(
+  PresignUploadPartRequest.builder()
+    .signatureDuration(Duration.ofMinutes(10))
+    .uploadPartRequest(partReq)
+    .build()
+);
+
+URL preSignedUrl = presigned.url(); // return to client
+```
+
+**Azure equivalent:** generate a **SAS URL** on the blob path with write permission and expiry via `BlobServiceClient` + `BlobClient.generateSas(...)`.
+
+#### S3 APIs used in resumable upload
+
+| Step | S3 API | Who calls it | Purpose |
+|------|--------|--------------|---------|
+| Init | `CreateMultipartUpload` | Backend | Start upload session; get `UploadId` |
+| Upload chunk | `UploadPart` (via **pre-signed URL**) | **Client → S3 directly** | Store one part; returns **ETag** |
+| Resume check | `ListParts` | Backend | See which parts already uploaded |
+| Complete | `CompleteMultipartUpload` | Backend | Merge parts using `{PartNumber, ETag}` list |
+| Abort / cleanup | `AbortMultipartUpload` | Backend (cron) | Delete incomplete uploads after TTL |
+
+#### Azure Blob equivalent
+
+| S3 | Azure Blob |
+|----|--------------|
+| `CreateMultipartUpload` | Stage blocks with unique block IDs |
+| `UploadPart` (pre-signed) | `Put Block` via SAS URL |
+| `ListParts` | `Get Block List` |
+| `CompleteMultipartUpload` | `Commit Block List` |
+| `AbortMultipartUpload` | Delete uncommitted blob / blocks |
 
 ---
 
-### 2.3 Glossary
+### 2.2.1 Base URL (API prefix — different from pre-signed URL)
+
+**Base URL** (also **root URL** or **environment URL**) is the **prefix** for calling *your API* — not object storage.
+
+| Environment | Base URL |
+|-------------|----------|
+| Production | `https://api.example.com/v1` |
+| Staging | `https://staging-api.example.com/v1` |
+| Local | `https://localhost:8443/v1` |
+
+| Reason | Explanation |
+|--------|-------------|
+| **Environment separation** | Dev, staging, prod each have their own Base URL |
+| **Configuration** | Client stores one Base URL; builds API calls as `baseURL + "/uploads/init"` |
+| **Security** | Prod credentials never hit staging endpoints |
+
+| Part | Example |
+|------|---------|
+| **Base URL** | `https://api.example.com/v1` |
+| **Path** | `/uploads/init` |
+| **Full API URL** | `https://api.example.com/v1/uploads/init` |
+| **Pre-signed URL** (separate) | `https://mybucket.s3.amazonaws.com/uploads/...?X-Amz-Signature=...&X-Amz-Expires=600` |
+
+```mermaid
+flowchart LR
+    A[Environment config] --> B["Base URL<br/>https://api.example.com/v1"]
+    C[API path] --> D[Full API request URL]
+    B --> D
+    D --> E["POST /uploads/init<br/>(metadata only)"]
+    E --> F[API returns pre-signed URLs]
+    F --> G["PUT https://bucket.s3.../part-1?Signature=...<br/>(file bytes go here)"]
+```
+
+---
+
+### 2.3 Object storage: why S3 or Azure Blob?
+
+Object storage holds the **actual file bytes**. Your API server holds **metadata only** (upload_uid, parts received, user_uid).
+
+#### Why object storage at all?
+
+| Option | Why not for large files |
+|--------|-------------------------|
+| **Store in DB (BLOB column)** | Expensive, poor performance at GB scale, bloats backups |
+| **Store on app server disk** | Not durable, doesn't scale horizontally, lost on restart |
+| **Block storage (EBS/disk)** | Tied to one machine; hard to serve parallel uploads globally |
+| **Object storage (S3 / Azure Blob)** | Built for massive parallel writes, 11×9s durability, multipart API, cheap |
+
+#### S3 vs Azure Blob — when to pick which
+
+| Factor | **Amazon S3** | **Azure Blob Storage** |
+|--------|---------------|------------------------|
+| **Best when** | AWS-native stack, broad tooling, multi-cloud portability | Microsoft / Azure interview, Azure-first org, AD integration |
+| **Multipart upload** | Mature `CreateMultipartUpload` / `UploadPart` / `CompleteMultipartUpload` | Block blobs: stage blocks + commit block list |
+| **Pre-signed access** | Pre-signed URL (SigV4) | SAS (Shared Access Signature) URL |
+| **Durability** | 99.999999999% (11 nines) | 99.999999999% (LRS) / geo-redundant options |
+| **Eventing** | S3 Event → Lambda/SQS | Event Grid → Functions/Queue |
+| **Interview tip** | Say "S3" for general system design | Say "Azure Blob" when interviewer is Microsoft-focused |
+
+**Neither is universally "better"** — pick based on cloud ecosystem:
+
+- **Prefer S3** when: team is on AWS, need widest S3-compatible tooling (MinIO, CloudFront), or designing a cloud-agnostic pattern.
+- **Prefer Azure Blob** when: Microsoft shop, Azure SQL + Azure Cache for Redis + App Service already chosen, or interviewer expects Azure services.
+
+**In both cases the pattern is identical:**
+
+```text
+Client ──(metadata)──► API Gateway ──► Upload Service ──► DB (metadata)
+Client ──(file bytes)──► Object Storage  (via pre-signed URL / SAS — never through API)
+```
+
+#### Why we never proxy file bytes through the backend
+
+- Upload bandwidth scales with **storage**, not your app tier.
+- App servers stay **stateless** and cheap to scale.
+- Storage handles **parallel part uploads** natively.
+- Pre-signed URLs enforce **least privilege** — client can only write to one key for a limited time.
+
+---
+
+### 2.4 Glossary
 
 | Term | Meaning | Why it matters |
 |------|---------|----------------|
+| **Base URL** | API environment prefix (e.g. `https://api.example.com/v1`) | All API calls built as Base URL + path; **not** the same as pre-signed URL |
+| **Pre-signed URL** | Temporary signed HTTPS URL for direct S3/Azure upload/download | Client uploads file bytes without storage credentials; expires in minutes |
+| **SAS (Azure)** | Shared Access Signature — Azure's equivalent of a pre-signed URL | Scoped write/read on a specific blob path with expiry |
+| **ETag** | Entity tag returned by S3 per uploaded part | Required to call `CompleteMultipartUpload` |
 | **API key** | Secret value identifying the client/app | Used for auth and rate limiting per client. |
 | **Token (JWT/OAuth)** | Short-lived credential for a user/session | Auth per request; often tied to a session UID. |
 | **Endpoint** | URL path + method (e.g. `POST /orders`) | Defines what operation is performed. |
@@ -372,13 +523,13 @@ flowchart TD
 
 ---
 
-### 2.4 Resumable file upload
+### 2.5 Resumable file upload (with pre-signed URLs)
 
 When a **file upload is interrupted** (connection drop, timeout, device sleep), the client can **resume** from the last successfully uploaded byte instead of restarting from zero.
 
 ---
 
-#### 2.4.1 Why uploads get interrupted
+#### 2.5.1 Why uploads get interrupted
 
 | Cause | Example |
 |-------|---------|
@@ -389,106 +540,123 @@ When a **file upload is interrupted** (connection drop, timeout, device sleep), 
 
 ---
 
-#### 2.4.2 How resume works (high level)
+#### 2.5.2 How resume works (high level)
 
-1. **Split file into chunks** (e.g. 5–10 MB each). Each chunk has a **byte range** (start–end).
-2. **Server tracks progress** per upload: an **upload ID** (UID) and which byte ranges have been received.
-3. **Client sends chunks** (in order or parallel). For each chunk: send **range** (e.g. `Bytes=0-5242879`) and **upload ID**.
-4. **On interruption:** Client remembers how much was sent (or asks server “what’s the next offset?”).
-5. **On resume:** Client asks server for **current status** (which ranges are done), then sends only **missing chunks/ranges**.
+1. **Split file into chunks** (e.g. 5–10 MB each). Each chunk maps to one **S3 part** or **Azure block**.
+2. **Client calls API** (`POST /uploads/init` via Base URL) — server returns **upload_uid** and **pre-signed URLs** (one per part).
+3. **Client uploads chunks directly to S3/Azure** using pre-signed URLs (parallel `PUT` requests).
+4. **Server tracks progress** in DB: upload_uid, part numbers received, ETags/block IDs.
+5. **On interruption:** Client calls `GET /uploads/{uid}/status` or uses `ListParts` server-side to find missing parts.
+6. **On resume:** Client requests fresh pre-signed URLs for missing parts only, then continues upload.
+7. **Complete:** Backend calls `CompleteMultipartUpload` (S3) or `Commit Block List` (Azure) → returns **file_uid**.
 
 ---
 
-#### 2.4.3 Server-side: what we store
+#### 2.5.3 Server-side: what we store
 
 | What | Where | Purpose |
 |------|--------|---------|
-| **Upload UID** | Returned at “init upload”; used in every chunk request | Ties all chunks to one logical file. |
-| **File metadata** | DB or cache (keyed by upload_uid) | Filename, size, content-type, user_uid. |
-| **Received ranges** | DB or blob metadata (e.g. Azure Blob “block list”) | Know which byte ranges are already stored. |
-| **Temporary storage** | Blob storage (e.g. Azure Blob “blocks”) | Chunks stored until “commit” merges them into final file. |
+| **Upload UID** | Metadata DB | Returned at init; ties all parts to one file |
+| **S3 UploadId / Azure block list** | Metadata DB (or returned once to client) | Storage session identifier for multipart |
+| **File metadata** | DB (keyed by upload_uid) | Filename, size, content-type, user_uid |
+| **Part ETags / block IDs** | DB after each part completes | Required to commit/complete the upload |
+| **File bytes** | **S3 or Azure Blob** (via pre-signed URL) | Chunks stored as parts/blocks until commit |
 
 **Commit step:** When server has received all ranges (sum of ranges = file size), it **commits** the upload (e.g. blob “put block list”) and returns the final **file UID** or URL. Until then, the upload is “in progress” and can be resumed.
 
 ---
 
-#### 2.4.4 Client-side: resume logic
+#### 2.5.4 Client-side: resume logic
 
-1. **Before upload:** Call `POST /uploads/init` with filename, size, optional hash → server returns **upload_uid** and optionally **chunk_size**.
-2. **Upload chunks:** For each chunk, `PUT /uploads/{upload_uid}?offset=0&length=5242880` with body = chunk bytes. Store last successful offset locally (or query server).
-3. **On failure:** On connection error or 5xx, **do not** discard progress. Save `last_successful_offset`.
-4. **On resume:** Call `GET /uploads/{upload_uid}/status` → server returns `{ "received_ranges": [[0, 5242879], [10485760, 15728639]], "total_size": 20971520 }`. Client sends only ranges not in `received_ranges`.
-5. **Complete:** When all bytes received, server commits and returns 200/201 with file UID or download URL.
+1. **Before upload:** `POST /uploads/init` (Base URL) → server returns **upload_uid**, **chunk_size**, and pre-signed URLs (or URL per part on demand).
+2. **Upload chunks:** For each part, `PUT {preSignedUrl}` with chunk bytes → S3/Azure returns **ETag** (S3) or **blockId** (Azure). Report ETag to API: `POST /uploads/{uid}/parts/{n}/complete`.
+3. **On failure:** Save `upload_uid` and last completed part number locally.
+4. **On resume:** `GET /uploads/{uid}/status` → get missing parts → request fresh pre-signed URLs for those parts only.
+5. **Complete:** When all parts done, `POST /uploads/{uid}/complete` → server commits in S3/Azure → returns **file_uid**.
 
 ---
 
-#### 2.4.5 Flow — initial upload
+#### 2.5.5 Flow — initial upload (pre-signed URL to S3)
 
 ```mermaid
 sequenceDiagram
     participant Client
-    participant Server
-    participant Storage as Blob Storage
+    participant API as Upload API
+    participant DB as Metadata DB
+    participant S3 as S3 / Azure Blob
 
-    Client->>Server: POST /uploads/init (filename, size)
-    Server-->>Client: 201 upload_uid, chunk_size
-    Client->>Server: PUT /uploads/{uid}?offset=0 (chunk 1)
-    Server->>Storage: Store block 1
-    Server-->>Client: 200 OK
-    Client->>Server: PUT /uploads/{uid}?offset=5242880 (chunk 2)
-    Note over Client,Server: CONNECTION DROPS — chunk 2 incomplete
+    Client->>API: POST /uploads/init (filename, size)
+    API->>DB: Create upload_uid row
+    API->>S3: CreateMultipartUpload
+    S3-->>API: UploadId
+    API->>API: Generate pre-signed URL for part 1 & 2
+    API-->>Client: 201 upload_uid + preSignedUrls[]
+    Client->>S3: PUT part 1 (pre-signed URL)
+    S3-->>Client: 200 + ETag
+    Client->>API: POST /parts/1/complete (ETag)
+    Client->>S3: PUT part 2 (pre-signed URL)
+    Note over Client,S3: CONNECTION DROPS — part 2 incomplete
 ```
 
 ---
 
-#### 2.4.6 Flow — after interruption: resume
+#### 2.5.6 Flow — after interruption: resume
 
 ```mermaid
 sequenceDiagram
     participant Client
-    participant Server
-    participant Storage as Blob Storage
+    participant API as Upload API
+    participant S3 as S3 / Azure Blob
 
-    Client->>Server: GET /uploads/{upload_uid}/status
-    Server-->>Client: 200 received_ranges, total_size
-    Client->>Server: PUT missing chunk(s) only
-    Server->>Storage: Store remaining blocks
-    Server-->>Client: 200 OK
-    Client->>Server: POST /uploads/{upload_uid}/commit
-    Server->>Storage: Commit block list → final blob
-    Server-->>Client: 201 file_uid / download URL
+    Client->>API: GET /uploads/{upload_uid}/status
+    API->>S3: ListParts (server-side)
+    S3-->>API: parts 1 done, part 2 missing
+    API-->>Client: 200 missingParts: [2]
+    Client->>API: GET /uploads/{uid}/parts/2/presign
+    API-->>Client: fresh pre-signed URL for part 2
+    Client->>S3: PUT part 2 (pre-signed URL)
+    S3-->>Client: 200 + ETag
+    Client->>API: POST /uploads/{uid}/complete
+    API->>S3: CompleteMultipartUpload (ETag list)
+    S3-->>API: 200 final object
+    API-->>Client: 201 file_uid / download URL
 ```
 
 ---
 
-#### 2.4.7 Flow — decision view (when to resume vs start over)
+#### 2.5.7 Flow — decision view (when to resume vs start over)
 
 ```mermaid
 flowchart TD
     A[User selects file] --> B{Have existing upload_uid?}
     B -->|Yes| C[GET /uploads/{uid}/status]
-    C --> D[Upload missing ranges only]
-    B -->|No| E[POST /uploads/init]
-    E --> F[Upload all chunks from offset 0]
-    D --> G{All bytes received?}
-    F --> G
-    G -->|No| H[Save last successful offset<br/>Retry on reconnect]
-    H --> C
-    G -->|Yes| I[POST /uploads/{uid}/commit]
-    I --> J[Return file_uid / download URL]
+    C --> D[Request pre-signed URLs for missing parts only]
+    B -->|No| E[POST /uploads/init via Base URL]
+    E --> F[Receive upload_uid + pre-signed URLs]
+    F --> G[PUT chunks directly to S3/Azure]
+    D --> G
+    G --> H{All parts uploaded + ETags recorded?}
+    H -->|No| I[Save upload_uid locally<br/>Retry on reconnect]
+    I --> C
+    H -->|Yes| J[POST /uploads/{uid}/complete]
+    J --> K[S3: CompleteMultipartUpload]
+    K --> L[Return file_uid / download URL]
 ```
 
 ---
 
-#### 2.4.8 Other details
+#### 2.5.8 Other details
 
 | Topic | Detail |
 |-------|--------|
-| **Chunk size** | Typically 5–10 MB. Larger = fewer requests but more lost on interrupt; smaller = more overhead. |
-| **Checksum** | Optional: send hash per chunk (e.g. MD5/SHA) in header; server verifies before accepting. Reduces corruption on resume. |
-| **Expiry** | Incomplete uploads (upload_uid with no commit) can be deleted after 24–48 hours to free temporary storage. |
-| **Concurrency** | Multiple chunks can be sent in parallel (different offsets); server merges by range at commit. |
-| **Azure** | Azure Blob “block blob” upload uses “stage block” (per chunk) + “commit block list”; same idea as above. |
+| **Chunk size** | 5–10 MB per S3 part (min 5 MB except last part). Larger = fewer requests; smaller = finer resume granularity. |
+| **Pre-signed URL expiry** | 10–15 min typical; client must request fresh URLs if expired before upload completes. |
+| **ETag** | S3 returns ETag per part; required in `CompleteMultipartUpload` part list. |
+| **Checksum** | Optional `Content-MD5` or SHA256 in signed headers; server verifies before accepting part. |
+| **Expiry of incomplete uploads** | Cron calls `AbortMultipartUpload` / deletes uncommitted blobs after 24–48 h. |
+| **Concurrency** | Multiple parts upload in parallel via separate pre-signed URLs. |
+| **S3** | `CreateMultipartUpload` → `UploadPart` (pre-signed) → `CompleteMultipartUpload` |
+| **Azure Blob** | Stage blocks via SAS URL → `Commit Block List` |
 
 ---
 
@@ -507,7 +675,7 @@ Low-Level Design breaks the HLD into **concrete modules, classes, APIs, and data
 | Attribute | Description |
 |-----------|-------------|
 | **Responsibility** | Accept HTTP request, validate headers, resolve identity (UID/session), route to correct handler. |
-| **Inputs** | Full URL (Pre-URL + path); headers (e.g. `Authorization`, `X-Request-Id`, `X-Session-Id`); body (for POST/PUT/PATCH). |
+| **Inputs** | Full URL (Base URL + path); headers (e.g. `Authorization`, `X-Request-Id`, `X-Session-Id`); body (for POST/PUT/PATCH). |
 | **Outputs** | Parsed path, method, query params; resolved user/session UID (if authenticated); request UID for logging. |
 
 ```mermaid
@@ -566,7 +734,7 @@ sequenceDiagram
 **Operations:**
 
 - **Get by UID:** Validate requester has access, fetch by user UID, return representation.
-- **Create:** Generate new UID, validate input, persist, return 201 + location using Pre-URL.
+- **Create:** Generate new UID, validate input, persist, return 201 + location using Base URL.
 - **Update/Delete:** Resolve entity by UID, check permissions, apply change.
 
 ```mermaid
@@ -579,7 +747,7 @@ flowchart LR
     E --> G[Persist to DB]
     F --> G
     G --> H[Invalidate / update cache]
-    H --> I["Response + Location header<br/>Pre-URL + path + uid"]
+    H --> I["Response + Location header<br/>Base URL + path + uid"]
 ```
 
 ---
@@ -602,15 +770,15 @@ flowchart LR
 
 #### URL structure
 
-All URLs are built as: **`{Pre-URL}{/path}[/{resource_uid}]`**
+All URLs are built as: **`{Base URL}{/path}[/{resource_uid}]`**
 
 | Method | URL pattern | Description |
 |--------|-------------|-------------|
-| GET | `{Pre-URL}/users` | List (with pagination) |
-| GET | `{Pre-URL}/users/{user_uid}` | Get one user by UID |
-| POST | `{Pre-URL}/users` | Create user (server assigns UID) |
-| PATCH | `{Pre-URL}/users/{user_uid}` | Update by UID |
-| DELETE | `{Pre-URL}/users/{user_uid}` | Delete by UID |
+| GET | `{Base URL}/users` | List (with pagination) |
+| GET | `{Base URL}/users/{user_uid}` | Get one user by UID |
+| POST | `{Base URL}/users` | Create user (server assigns UID) |
+| PATCH | `{Base URL}/users/{user_uid}` | Update by UID |
+| DELETE | `{Base URL}/users/{user_uid}` | Delete by UID |
 
 #### Headers
 
@@ -623,7 +791,7 @@ All URLs are built as: **`{Pre-URL}{/path}[/{resource_uid}]`**
 
 #### Response conventions
 
-- **201 Created:** Include `Location: {Pre-URL}/resources/{new_uid}`.
+- **201 Created:** Include `Location: {Base URL}/resources/{new_uid}`.
 - **404 Not Found:** When no resource exists for given UID.
 - **403 Forbidden:** When identity (resolved from token/UID) is not allowed to access the resource.
 
@@ -641,9 +809,9 @@ sequenceDiagram
     participant Handler
     participant DB
 
-    Client->>Config: Read Pre-URL for environment
+    Client->>Config: Read Base URL for environment
     Config-->>Client: base URL
-    Client->>Gateway: GET Pre-URL/users/{uid} + token
+    Client->>Gateway: GET Base URL/users/{uid} + token
     Gateway->>Auth: Validate identity
     Auth->>Redis: Session lookup
     Redis-->>Auth: user_uid
@@ -716,21 +884,26 @@ flowchart LR
     A[Create entity] --> B[Generate UID]
     B --> C[(Insert into DB)]
     C --> D[(Optional: cache in Redis)]
-    D --> E["201 Created<br/>Location: Pre-URL + path + uid"]
+    D --> E["201 Created<br/>Location: Base URL + path + uid"]
     E --> F[Client stores / uses UID]
     F --> G[Subsequent requests reference UID]
     G --> H[Server resolves entity by UID]
 ```
 
-### 5.3 Pre-URL usage (client-side) — detailed
+### 5.3 Base URL vs pre-signed URL (client-side)
 
 ```mermaid
 flowchart LR
-    A[Environment config] --> B["Pre-URL<br/>e.g. https://api.example.com/v1"]
-    C[Resource path + UID] --> D[Build full URL]
-    B --> D
-    D --> E["Full URL<br/>Pre-URL + /users/{uid}"]
-    E --> F[HTTP request]
+    subgraph API calls
+        A[Environment config] --> B["Base URL<br/>https://api.example.com/v1"]
+        C[API path] --> D[Full API URL]
+        B --> D
+        D --> E["POST /uploads/init"]
+    end
+    subgraph File bytes
+        F[API returns pre-signed URLs] --> G["PUT https://bucket.s3.../part-1?Signature=..."]
+    end
+    E --> F
 ```
 
 ---
@@ -745,10 +918,11 @@ flowchart LR
 |---|----------|------------------------|
 | 1 | How would you scale this to 10x traffic? | Stateless app tier + horizontal scaling; Redis for session/cache; DB read replicas; partition by UID if needed. |
 | 2 | How do you ensure high availability? | Multi-AZ / multi-region for gateway and app; DB replication (primary + replica); Redis cluster; health checks and failover. |
-| 3 | How would you secure the API? | TLS (Pre-URL is HTTPS); auth (token → user/session UID); rate limiting (e.g. Redis); audit logs with UID. |
-| 4 | Why use a gateway instead of clients calling services directly? | Single entry point; TLS termination; rate limit; request UID; routing by path/Pre-URL. |
-| 5 | How do you handle different environments (dev/staging/prod)? | Different Pre-URL per environment; same code, config-driven base URL. |
-| 6 | When would you add a message queue? | Async processing (e.g. send email, update caches); decouple producer/consumer; use queue for jobs keyed by UID where needed. |
+| 3 | How would you secure the API? | TLS (HTTPS Base URL); auth (token → user/session UID); pre-signed URLs for scoped storage access; rate limiting (Redis); audit logs with UID. |
+| 4 | Why use a gateway instead of clients calling services directly? | Single entry point; TLS termination; rate limit; request UID; routing by path. |
+| 5 | How do you handle different environments (dev/staging/prod)? | Different Base URL per environment; same code, config-driven. |
+| 6 | Why upload to S3/Azure instead of through the API? | Pre-signed URLs offload bandwidth to storage; backend stays stateless; scoped time-bound permissions. |
+| 7 | When would you add a message queue? | Async processing (e.g. send email, update caches); decouple producer/consumer; use queue for jobs keyed by UID where needed. |
 
 ### 6.2 LLD follow-up questions
 
@@ -773,7 +947,7 @@ flowchart LR
 |---|----------|--------------------|
 | 1 | **You have 1 DB and 1 Redis. DB is the bottleneck. What do you add or change?** | Add read replicas for DB; use Redis more (cache by UID, session); move heavy reads to cache or replicas; consider partitioning by UID. |
 | 2 | **Client sends the same request twice (e.g. double click). How do you make the operation safe?** | Idempotency key per request; server stores key → result in Redis; second request returns same result without re-running mutation. |
-| 3 | **How would you support multiple regions (e.g. US, EU)?** | Different Pre-URL or same domain with geo-routing; data residency: DB/cache per region or replicate; UID globally unique so same UID works everywhere. |
+| 3 | **How would you support multiple regions (e.g. US, EU)?** | Different Base URL or same domain with geo-routing; data residency: DB/cache per region or replicate; UID globally unique so same UID works everywhere. |
 | 4 | **Why not store everything in Redis?** | Redis is in-memory, volatile; DB gives durability, consistency, and larger storage; use Redis for cache/session, DB for source of truth. |
 | 5 | **Traffic is spiky. How do you design for bursts?** | Auto-scaling app tier; queue to smooth writes; Redis to absorb read spikes; rate limiting to protect DB and backend. |
 
@@ -793,27 +967,29 @@ flowchart LR
 
 | Version | Date | Author | Changes |
 |---------|------|--------|---------|
+| 1.5 | 2025-06-28 | — | Clarified pre-signed URLs vs Base URL; S3/Azure Blob usage and generation flow |
 | 1.4 | 2025-06-28 | — | Replaced Excalidraw links with inline Mermaid flow diagrams |
 | 1.3 | 2025-02-17 | — | All flowcharts moved to Excalidraw (HLD-LLD-diagrams folder); Mermaid/ASCII replaced with Excalidraw links |
 | 1.2 | 2025-02-17 | — | UID generation logic; resumable file upload; ASCII flow diagrams |
 | 1.1 | 2025-02-17 | — | Prettier flowcharts; Data layer (DB, Redis); Microsoft interview; follow-up & logic questions |
-| 1.0 | 2025-02-17 | — | Initial HLD + LLD; Confluence-style; UID/Pre-URL |
+| 1.0 | 2025-02-17 | — | Initial HLD + LLD; Confluence-style; UID/Base URL |
+
+---
 
 ---
 
 > **💡 Confluence / GitHub:** Mermaid diagrams render natively on GitHub. For Confluence, paste into a Mermaid macro or export PNG from [mermaid.live](https://mermaid.live).  
-> **🎯 Microsoft interview:** Use Part 4 (DB/Redis), Part 6 (follow-ups), and Part 7 (logic) to practice explaining your design and trade-offs.
+> **🎯 Microsoft interview:** Use Part 2 (pre-signed URLs, S3/Azure), Part 4 (DB/Redis), Part 6 (follow-ups), and Part 7 (logic) to practice explaining your design and trade-offs.
 
-How UID is generated
-Use a collision-resistant algorithm in the app/service layer:
-UUID v4 (random) for general purpose, or
-ULID (timestamp + random) if you want time-sortable IDs.
-Optionally add a type prefix for readability: usr_, sess_, upl_, fil_.
-Example: usr_01J2... (ULID) or usr_550e8400e29b... (UUIDv4 without dashes)
-How it guarantees “no duplicates”
-It’s a two-layer guarantee:
-Layer 1 (practical uniqueness): UUIDv4/ULID have an astronomically low collision probability, even across many servers.
-Layer 2 (hard guarantee in DB): the database column uid has a UNIQUE constraint / UNIQUE index.
-If a collision ever happens, the insert fails with a “duplicate key” error.
-The service then generates a new UID and retries.
-So: algorithm makes collisions extremely unlikely, and the DB unique index makes duplicates impossible to store.
+### Appendix — UID generation summary
+
+**How UID is generated:** Use a collision-resistant algorithm in the app/service layer:
+- **UUID v4** (random) for general purpose, or
+- **ULID** (timestamp + random) if you want time-sortable IDs.
+- Optionally add a type prefix: `usr_`, `sess_`, `upl_`, `fil_`.
+- Example: `usr_01J2...` (ULID) or `usr_550e8400e29b...` (UUIDv4 without dashes)
+
+**How it guarantees no duplicates:**
+1. **Layer 1 (practical):** UUIDv4/ULID collision probability is astronomically low across servers.
+2. **Layer 2 (hard guarantee):** DB column `uid` has a **UNIQUE** constraint/index.
+3. On duplicate key error, generate a new UID and retry.
